@@ -7,6 +7,12 @@ interface ErrorDetail {
   value: string;
   proposed?: string;
   reason?: string;
+  sheet?: string;
+  severity?: 'critical' | 'warning' | 'info';
+}
+
+interface ValidationError extends ErrorDetail {
+  validationType?: 'type' | 'merged' | 'format' | 'cross-sheet';
 }
 
 const ERROR_PATTERNS = {
@@ -18,10 +24,15 @@ const ERROR_PATTERNS = {
   NA: /#N\/A/gi,
 };
 
+// Padrões para detecção de tipos de dados
+const NUMBER_PATTERN = /^-?\d+\.?\d*$/;
+const DATE_PATTERN = /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/;
+const CURRENCY_PATTERN = /^[R$€£¥]\s*-?\d+[.,]?\d*$/;
+
 const VLOOKUP_REGEX = /VLOOKUP\s*\(/gi;
 const PROCV_REGEX = /PROCV\s*\(/gi;
 
-export const analyzeExcelFile = async (file: File): Promise<ErrorDetail[]> => {
+export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): Promise<ErrorDetail[]> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
@@ -31,46 +42,73 @@ export const analyzeExcelFile = async (file: File): Promise<ErrorDetail[]> => {
         const workbook = XLSX.read(data, { type: 'binary', cellFormula: true });
         const errors: ErrorDetail[] = [];
 
-        // Analisar primeira planilha por padrão
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
+        // Determinar quais sheets analisar
+        const sheetsToAnalyze = selectedSheets && selectedSheets.length > 0 
+          ? selectedSheets 
+          : workbook.SheetNames;
 
-        // Percorrer todas as células
-        const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
-        
-        for (let R = range.s.r; R <= range.e.r; R++) {
-          for (let C = range.s.c; C <= range.e.c; C++) {
-            const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
-            const cell = worksheet[cellAddress];
+        // Analisar cada sheet selecionado
+        sheetsToAnalyze.forEach(sheetName => {
+          if (!workbook.Sheets[sheetName]) return;
+          
+          const worksheet = workbook.Sheets[sheetName];
+          const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
+          
+          // Detectar células mescladas
+          const mergedCells = worksheet['!merges'] || [];
+          
+          // Análise de fórmulas e erros
+          for (let R = range.s.r; R <= range.e.r; R++) {
+            for (let C = range.s.c; C <= range.e.c; C++) {
+              const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+              const cell = worksheet[cellAddress];
 
-            if (!cell) continue;
+              if (!cell) continue;
 
-            const cellValue = cell.v?.toString() || '';
-            const cellFormula = cell.f || '';
-            
-            // Detectar erros no valor
-            for (const [errorType, pattern] of Object.entries(ERROR_PATTERNS)) {
-              if (pattern.test(cellValue) || pattern.test(cellFormula)) {
-                const error: ErrorDetail = {
-                  row: R + 1,
-                  col: XLSX.utils.encode_col(C),
-                  type: errorType,
-                  value: cellFormula ? `=${cellFormula}` : cellValue,
-                };
+              const cellValue = cell.v?.toString() || '';
+              const cellFormula = cell.f || '';
+              
+              // 1. Detectar erros de fórmula
+              for (const [errorType, pattern] of Object.entries(ERROR_PATTERNS)) {
+                if (pattern.test(cellValue) || pattern.test(cellFormula)) {
+                  const error: ErrorDetail = {
+                    row: R + 1,
+                    col: XLSX.utils.encode_col(C),
+                    type: errorType,
+                    value: cellFormula ? `=${cellFormula}` : cellValue,
+                    sheet: sheetName,
+                    severity: errorType === 'REF' || errorType === 'DIV' ? 'critical' : 'warning',
+                  };
 
-                // Propor correção baseada no tipo de erro
-                const proposal = proposeFixForError(error, cellFormula, worksheet, range);
-                if (proposal) {
-                  error.proposed = proposal.formula;
-                  error.reason = proposal.reason;
+                  const proposal = proposeFixForError(error, cellFormula, worksheet, range, workbook);
+                  if (proposal) {
+                    error.proposed = proposal.formula;
+                    error.reason = proposal.reason;
+                  }
+
+                  errors.push(error);
+                  break;
                 }
-
-                errors.push(error);
-                break;
+              }
+              
+              // 2. Validação de tipos de dados
+              if (cellValue && !cellFormula) {
+                const typeError = validateDataType(cell, R, C, sheetName, worksheet, range);
+                if (typeError) errors.push(typeError);
               }
             }
           }
-        }
+          
+          // 3. Validar células mescladas problemáticas
+          mergedCells.forEach(merge => {
+            const mergeError = validateMergedCell(merge, sheetName, worksheet);
+            if (mergeError) errors.push(mergeError);
+          });
+          
+          // 4. Detectar referências cruzadas quebradas entre sheets
+          const crossSheetErrors = validateCrossSheetReferences(worksheet, sheetName, workbook, range);
+          errors.push(...crossSheetErrors);
+        });
 
         resolve(errors);
       } catch (error) {
@@ -83,11 +121,124 @@ export const analyzeExcelFile = async (file: File): Promise<ErrorDetail[]> => {
   });
 };
 
+// Nova função: Validar tipo de dados
+const validateDataType = (
+  cell: XLSX.CellObject,
+  row: number,
+  col: number,
+  sheetName: string,
+  worksheet: XLSX.WorkSheet,
+  range: XLSX.Range
+): ErrorDetail | null => {
+  const cellValue = cell.v?.toString() || '';
+  const colLetter = XLSX.utils.encode_col(col);
+  
+  // Detectar coluna de números com texto
+  let numericCount = 0;
+  let textCount = 0;
+  
+  for (let R = range.s.r; R <= Math.min(range.s.r + 20, range.e.r); R++) {
+    const checkCell = worksheet[XLSX.utils.encode_cell({ r: R, c: col })];
+    if (!checkCell || checkCell.f) continue;
+    
+    const val = checkCell.v?.toString() || '';
+    if (NUMBER_PATTERN.test(val)) numericCount++;
+    else if (val.length > 0) textCount++;
+  }
+  
+  // Se coluna é majoritariamente numérica mas tem texto
+  if (numericCount > 5 && textCount < numericCount / 3) {
+    if (!NUMBER_PATTERN.test(cellValue) && cellValue.length > 0) {
+      return {
+        row: row + 1,
+        col: colLetter,
+        type: 'TYPE_MISMATCH',
+        value: cellValue,
+        sheet: sheetName,
+        severity: 'warning',
+        reason: 'Texto detectado em coluna numérica. Isso pode causar erros em cálculos.',
+      };
+    }
+  }
+  
+  return null;
+};
+
+// Nova função: Validar células mescladas
+const validateMergedCell = (
+  merge: XLSX.Range,
+  sheetName: string,
+  worksheet: XLSX.WorkSheet
+): ErrorDetail | null => {
+  const startCell = XLSX.utils.encode_cell({ r: merge.s.r, c: merge.s.c });
+  const endCell = XLSX.utils.encode_cell({ r: merge.e.r, c: merge.e.c });
+  
+  // Verificar se célula mesclada contém fórmulas (pode causar problemas)
+  const cell = worksheet[startCell];
+  if (cell && cell.f) {
+    return {
+      row: merge.s.r + 1,
+      col: XLSX.utils.encode_col(merge.s.c),
+      type: 'MERGED_FORMULA',
+      value: `Mesclado ${startCell}:${endCell}`,
+      sheet: sheetName,
+      severity: 'warning',
+      reason: 'Célula mesclada contém fórmula, o que pode causar comportamento inesperado.',
+    };
+  }
+  
+  return null;
+};
+
+// Nova função: Validar referências entre sheets
+const validateCrossSheetReferences = (
+  worksheet: XLSX.WorkSheet,
+  sheetName: string,
+  workbook: XLSX.WorkBook,
+  range: XLSX.Range
+): ErrorDetail[] => {
+  const errors: ErrorDetail[] = [];
+  const sheetRefPattern = /['"]?([^'"!]+)['"]?!/g;
+  
+  for (let R = range.s.r; R <= range.e.r; R++) {
+    for (let C = range.s.c; C <= range.e.c; C++) {
+      const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+      const cell = worksheet[cellAddress];
+      
+      if (!cell || !cell.f) continue;
+      
+      const formula = cell.f;
+      let match;
+      
+      while ((match = sheetRefPattern.exec(formula)) !== null) {
+        const referencedSheet = match[1];
+        
+        // Verificar se o sheet referenciado existe
+        if (!workbook.SheetNames.includes(referencedSheet)) {
+          errors.push({
+            row: R + 1,
+            col: XLSX.utils.encode_col(C),
+            type: 'CROSS_SHEET_REF',
+            value: `=${formula}`,
+            sheet: sheetName,
+            severity: 'critical',
+            reason: `Referência a sheet inexistente: "${referencedSheet}"`,
+            proposed: `=${formula.replace(match[0], `${workbook.SheetNames[0]}!`)}`,
+          });
+        }
+      }
+    }
+  }
+  
+  return errors;
+};
+
 const proposeFixForError = (
   error: ErrorDetail,
   formula: string,
   worksheet: XLSX.WorkSheet,
-  range: XLSX.Range
+  range: XLSX.Range,
+  workbook?: XLSX.WorkBook
 ): { formula: string; reason: string } | null => {
   if (!formula) return null;
 

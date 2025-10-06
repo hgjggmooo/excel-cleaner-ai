@@ -13,6 +13,8 @@ interface ErrorDetail {
   value: string;
   proposed?: string;
   reason?: string;
+  sheet?: string;
+  severity?: 'critical' | 'warning' | 'info';
 }
 
 interface AnalysisViewProps {
@@ -29,6 +31,15 @@ export const AnalysisView = ({ fileName, errors, onDownload, onBack }: AnalysisV
     acc[error.type] = (acc[error.type] || 0) + 1;
     return acc;
   }, {} as Record<string, number>);
+
+  const sheetCounts = errors.reduce((acc, error) => {
+    const sheet = error.sheet || 'Unknown';
+    acc[sheet] = (acc[sheet] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const criticalErrors = errors.filter(e => e.severity === 'critical').length;
+  const warningErrors = errors.filter(e => e.severity === 'warning').length;
 
   const toggleFix = (index: number) => {
     const newSelected = new Set(selectedFixes);
@@ -96,22 +107,46 @@ export const AnalysisView = ({ fileName, errors, onDownload, onBack }: AnalysisV
             </div>
           </Card>
 
-          {Object.entries(errorCounts).map(([type, count]) => (
-            <Card key={type} className="p-6 shadow-card">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">#{type}</p>
-                  <p className="text-3xl font-bold">{count}</p>
-                </div>
-                <Badge variant="destructive">{type}</Badge>
+          <Card className="p-6 shadow-card">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Críticos</p>
+                <p className="text-3xl font-bold text-destructive">{criticalErrors}</p>
               </div>
-            </Card>
-          ))}
+              <Badge variant="destructive">!</Badge>
+            </div>
+          </Card>
+
+          <Card className="p-6 shadow-card">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Avisos</p>
+                <p className="text-3xl font-bold text-yellow-600">{warningErrors}</p>
+              </div>
+              <Badge className="bg-yellow-600">⚠</Badge>
+            </div>
+          </Card>
+
+          <Card className="p-6 shadow-card">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Abas Analisadas</p>
+                <p className="text-3xl font-bold">{Object.keys(sheetCounts).length}</p>
+              </div>
+              <Badge variant="outline">{Object.keys(sheetCounts).length}</Badge>
+            </div>
+          </Card>
         </div>
 
         <Tabs defaultValue="all" className="space-y-6">
-          <TabsList className="bg-muted/50">
+          <TabsList className="bg-muted/50 flex-wrap h-auto">
             <TabsTrigger value="all">Todos ({errors.length})</TabsTrigger>
+            <TabsTrigger value="critical">Críticos ({criticalErrors})</TabsTrigger>
+            {Object.entries(sheetCounts).map(([sheet, count]) => (
+              <TabsTrigger key={sheet} value={`sheet-${sheet}`}>
+                {sheet} ({count})
+              </TabsTrigger>
+            ))}
             {Object.entries(errorCounts).map(([type, count]) => (
               <TabsTrigger key={type} value={type}>
                 #{type} ({count})
@@ -130,11 +165,23 @@ export const AnalysisView = ({ fileName, errors, onDownload, onBack }: AnalysisV
               >
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 space-y-3">
-                    <div className="flex items-center gap-3">
-                      <Badge variant="destructive">#{error.type}</Badge>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <Badge variant={error.severity === 'critical' ? 'destructive' : 'default'}>
+                        #{error.type}
+                      </Badge>
                       <span className="text-sm text-muted-foreground">
                         Célula: {error.col}{error.row}
                       </span>
+                      {error.sheet && (
+                        <Badge variant="outline" className="text-xs">
+                          📄 {error.sheet}
+                        </Badge>
+                      )}
+                      {error.severity && (
+                        <Badge variant="outline" className="text-xs">
+                          {error.severity === 'critical' ? '🔴 Crítico' : '⚠️ Aviso'}
+                        </Badge>
+                      )}
                     </div>
                     
                     <div className="space-y-2">
@@ -181,6 +228,148 @@ export const AnalysisView = ({ fileName, errors, onDownload, onBack }: AnalysisV
             ))}
           </TabsContent>
 
+          <TabsContent value="critical" className="space-y-4">
+            {errors
+              .filter((error) => error.severity === 'critical')
+              .map((error, index) => (
+                <Card 
+                  key={index} 
+                  className={`p-6 shadow-card transition-all cursor-pointer ${
+                    selectedFixes.has(errors.indexOf(error)) ? 'ring-2 ring-primary bg-primary/5' : ''
+                  }`}
+                  onClick={() => error.proposed && toggleFix(errors.indexOf(error))}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 space-y-3">
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <Badge variant="destructive">#{error.type}</Badge>
+                        <span className="text-sm text-muted-foreground">
+                          Célula: {error.col}{error.row}
+                        </span>
+                        {error.sheet && (
+                          <Badge variant="outline" className="text-xs">
+                            📄 {error.sheet}
+                          </Badge>
+                        )}
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div>
+                          <p className="text-sm font-medium text-muted-foreground mb-1">Valor Atual:</p>
+                          <code className="block p-3 bg-destructive/10 rounded-md text-sm font-mono">
+                            {error.value}
+                          </code>
+                        </div>
+                        
+                        {error.proposed && (
+                          <>
+                            <div>
+                              <p className="text-sm font-medium text-muted-foreground mb-1">Correção Proposta:</p>
+                              <code className="block p-3 bg-accent/10 rounded-md text-sm font-mono">
+                                {error.proposed}
+                              </code>
+                            </div>
+                            
+                            {error.reason && (
+                              <div className="flex items-start gap-2 p-3 bg-muted/50 rounded-md">
+                                <AlertCircle className="w-4 h-4 text-muted-foreground mt-0.5" />
+                                <p className="text-sm text-muted-foreground">{error.reason}</p>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    
+                    {error.proposed && (
+                      <div className="flex items-center">
+                        <input
+                          type="checkbox"
+                          checked={selectedFixes.has(errors.indexOf(error))}
+                          onChange={() => toggleFix(errors.indexOf(error))}
+                          className="w-5 h-5 rounded border-2 border-primary text-primary focus:ring-primary"
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </Card>
+              ))}
+          </TabsContent>
+
+          {Object.entries(sheetCounts).map(([sheet]) => (
+            <TabsContent key={`sheet-${sheet}`} value={`sheet-${sheet}`} className="space-y-4">
+              {errors
+                .filter((error) => error.sheet === sheet)
+                .map((error, index) => (
+                  <Card 
+                    key={index} 
+                    className={`p-6 shadow-card transition-all cursor-pointer ${
+                      selectedFixes.has(errors.indexOf(error)) ? 'ring-2 ring-primary bg-primary/5' : ''
+                    }`}
+                    onClick={() => error.proposed && toggleFix(errors.indexOf(error))}
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1 space-y-3">
+                        <div className="flex items-center gap-3 flex-wrap">
+                          <Badge variant={error.severity === 'critical' ? 'destructive' : 'default'}>
+                            #{error.type}
+                          </Badge>
+                          <span className="text-sm text-muted-foreground">
+                            Célula: {error.col}{error.row}
+                          </span>
+                          {error.severity && (
+                            <Badge variant="outline" className="text-xs">
+                              {error.severity === 'critical' ? '🔴 Crítico' : '⚠️ Aviso'}
+                            </Badge>
+                          )}
+                        </div>
+                        
+                        <div className="space-y-2">
+                          <div>
+                            <p className="text-sm font-medium text-muted-foreground mb-1">Valor Atual:</p>
+                            <code className="block p-3 bg-destructive/10 rounded-md text-sm font-mono">
+                              {error.value}
+                            </code>
+                          </div>
+                          
+                          {error.proposed && (
+                            <>
+                              <div>
+                                <p className="text-sm font-medium text-muted-foreground mb-1">Correção Proposta:</p>
+                                <code className="block p-3 bg-accent/10 rounded-md text-sm font-mono">
+                                  {error.proposed}
+                                </code>
+                              </div>
+                              
+                              {error.reason && (
+                                <div className="flex items-start gap-2 p-3 bg-muted/50 rounded-md">
+                                  <AlertCircle className="w-4 h-4 text-muted-foreground mt-0.5" />
+                                  <p className="text-sm text-muted-foreground">{error.reason}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                      
+                      {error.proposed && (
+                        <div className="flex items-center">
+                          <input
+                            type="checkbox"
+                            checked={selectedFixes.has(errors.indexOf(error))}
+                            onChange={() => toggleFix(errors.indexOf(error))}
+                            className="w-5 h-5 rounded border-2 border-primary text-primary focus:ring-primary"
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </Card>
+                ))}
+            </TabsContent>
+          ))}
+
           {Object.keys(errorCounts).map((type) => (
             <TabsContent key={type} value={type} className="space-y-4">
               {errors
@@ -195,11 +384,23 @@ export const AnalysisView = ({ fileName, errors, onDownload, onBack }: AnalysisV
                   >
                     <div className="flex items-start justify-between gap-4">
                       <div className="flex-1 space-y-3">
-                        <div className="flex items-center gap-3">
-                          <Badge variant="destructive">#{error.type}</Badge>
+                        <div className="flex items-center gap-3 flex-wrap">
+                          <Badge variant={error.severity === 'critical' ? 'destructive' : 'default'}>
+                            #{error.type}
+                          </Badge>
                           <span className="text-sm text-muted-foreground">
                             Célula: {error.col}{error.row}
                           </span>
+                          {error.sheet && (
+                            <Badge variant="outline" className="text-xs">
+                              📄 {error.sheet}
+                            </Badge>
+                          )}
+                          {error.severity && (
+                            <Badge variant="outline" className="text-xs">
+                              {error.severity === 'critical' ? '🔴 Crítico' : '⚠️ Aviso'}
+                            </Badge>
+                          )}
                         </div>
                         
                         <div className="space-y-2">
