@@ -39,13 +39,15 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
     reader.onload = (e) => {
       try {
         const data = e.target?.result;
-        const workbook = XLSX.read(data, { type: 'binary', cellFormula: true });
+        const workbook = XLSX.read(data, { type: 'binary', cellFormula: true, cellNF: true });
         const errors: ErrorDetail[] = [];
 
         // Determinar quais sheets analisar
         const sheetsToAnalyze = selectedSheets && selectedSheets.length > 0 
           ? selectedSheets 
           : workbook.SheetNames;
+
+        console.log('📊 Analisando sheets:', sheetsToAnalyze);
 
         // Analisar cada sheet selecionado
         sheetsToAnalyze.forEach(sheetName => {
@@ -54,8 +56,13 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
           const worksheet = workbook.Sheets[sheetName];
           const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
           
+          console.log(`🔍 Analisando "${sheetName}" - Range: ${XLSX.utils.encode_range(range)}`);
+          
           // Detectar células mescladas
           const mergedCells = worksheet['!merges'] || [];
+          
+          let cellsChecked = 0;
+          let formulaCells = 0;
           
           // Análise de fórmulas e erros
           for (let R = range.s.r; R <= range.e.r; R++) {
@@ -64,13 +71,51 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
               const cell = worksheet[cellAddress];
 
               if (!cell) continue;
+              
+              cellsChecked++;
 
               const cellValue = cell.v?.toString() || '';
               const cellFormula = cell.f || '';
+              const cellType = cell.t; // tipo: 'n' (number), 's' (string), 'e' (error), etc.
+              const cellError = cell.w; // valor formatado
               
-              // 1. Detectar erros de fórmula
+              if (cellFormula) formulaCells++;
+              
+              // CRÍTICO: Verificar se a célula tem tipo 'e' (error)
+              if (cellType === 'e') {
+                console.log(`❌ Erro detectado em ${cellAddress}:`, cellValue, cellFormula);
+                
+                let errorType = 'VALUE';
+                if (cellValue.includes('REF')) errorType = 'REF';
+                else if (cellValue.includes('DIV')) errorType = 'DIV';
+                else if (cellValue.includes('NAME')) errorType = 'NAME';
+                else if (cellValue.includes('NULL')) errorType = 'NULL';
+                else if (cellValue.includes('N/A')) errorType = 'NA';
+                
+                const error: ErrorDetail = {
+                  row: R + 1,
+                  col: XLSX.utils.encode_col(C),
+                  type: errorType,
+                  value: cellFormula ? `=${cellFormula}` : cellValue,
+                  sheet: sheetName,
+                  severity: errorType === 'REF' || errorType === 'DIV' ? 'critical' : 'warning',
+                };
+
+                const proposal = proposeFixForError(error, cellFormula, worksheet, range, workbook);
+                if (proposal) {
+                  error.proposed = proposal.formula;
+                  error.reason = proposal.reason;
+                }
+
+                errors.push(error);
+                continue;
+              }
+              
+              // 1. Detectar erros de fórmula via padrões de texto
               for (const [errorType, pattern] of Object.entries(ERROR_PATTERNS)) {
                 if (pattern.test(cellValue) || pattern.test(cellFormula)) {
+                  console.log(`⚠️ Erro de padrão detectado em ${cellAddress}:`, errorType);
+                  
                   const error: ErrorDetail = {
                     row: R + 1,
                     col: XLSX.utils.encode_col(C),
@@ -99,6 +144,8 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
             }
           }
           
+          console.log(`✅ "${sheetName}": ${cellsChecked} células verificadas, ${formulaCells} fórmulas`);
+          
           // 3. Validar células mescladas problemáticas
           mergedCells.forEach(merge => {
             const mergeError = validateMergedCell(merge, sheetName, worksheet);
@@ -110,8 +157,10 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
           errors.push(...crossSheetErrors);
         });
 
+        console.log(`🎯 Total de erros detectados: ${errors.length}`);
         resolve(errors);
       } catch (error) {
+        console.error('💥 Erro ao analisar:', error);
         reject(error);
       }
     };
