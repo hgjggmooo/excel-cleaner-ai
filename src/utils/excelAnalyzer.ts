@@ -319,13 +319,19 @@ export const applyFixes = (
         const data = e.target?.result;
         const workbook = XLSX.read(data, { type: 'binary', cellFormula: true });
         
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-
-        // Aplicar as correções selecionadas
+        // Aplicar as correções selecionadas em todas as sheets
         selectedFixes.forEach((index) => {
           const error = errors[index];
           if (error.proposed) {
+            // Determinar qual sheet usar (default para a primeira se não especificado)
+            const sheetName = error.sheet || workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            
+            if (!worksheet) {
+              console.warn(`Sheet "${sheetName}" não encontrada. Pulando correção.`);
+              return;
+            }
+            
             const cellAddress = `${error.col}${error.row}`;
             const cell = worksheet[cellAddress];
             
@@ -337,6 +343,14 @@ export const applyFixes = (
               
               cell.f = formula;
               delete cell.v; // Remover valor para forçar recálculo
+            } else {
+              // Criar célula se não existir
+              worksheet[cellAddress] = {
+                f: error.proposed.startsWith('=') 
+                  ? error.proposed.substring(1) 
+                  : error.proposed,
+                t: 'n'
+              };
             }
           }
         });
