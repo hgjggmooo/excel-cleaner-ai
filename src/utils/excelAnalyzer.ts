@@ -16,21 +16,29 @@ interface ValidationError extends ErrorDetail {
 }
 
 const ERROR_PATTERNS = {
-  REF: /#REF!/gi,
-  VALUE: /#VALUE!/gi,
-  NAME: /#NAME\?/gi,
-  DIV: /#DIV\/0!/gi,
-  NULL: /#NULL!/gi,
-  NA: /#N\/A/gi,
+  REF: /#REF!|#REF\?/gi,
+  VALUE: /#VALUE!|#VALOR!/gi,
+  NAME: /#NAME\?|#NOME\?/gi,
+  DIV: /#DIV\/0!|#DIV!|#DIV\/0\?/gi,
+  NULL: /#NULL!|#NULO!/gi,
+  NA: /#N\/A|#N\/D|#ND/gi,
+  NUM: /#NUM!|#NÚM!/gi,
+  GETTING_DATA: /#GETTING_DATA|#OBTENDO_DADOS/gi,
 };
 
 // Padrões para detecção de tipos de dados
 const NUMBER_PATTERN = /^-?\d+\.?\d*$/;
 const DATE_PATTERN = /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/;
-const CURRENCY_PATTERN = /^[R$€£¥]\s*-?\d+[.,]?\d*$/;
+const CURRENCY_PATTERN = /^[R$€£¥₹]\s*-?\d+[.,]?\d*$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_PATTERN = /^[\d\s\(\)\-\+]+$/;
 
-const VLOOKUP_REGEX = /VLOOKUP\s*\(/gi;
-const PROCV_REGEX = /PROCV\s*\(/gi;
+// Padrões de fórmulas suspeitas
+const VLOOKUP_REGEX = /VLOOKUP|PROCV/gi;
+const HLOOKUP_REGEX = /HLOOKUP|PROCH/gi;
+const INDEX_MATCH_REGEX = /INDEX.*MATCH|ÍNDICE.*CORRESP/gi;
+const SUMIF_REGEX = /SUMIF|SUMIFS|SOMASE|SOMASES/gi;
+const COUNTIF_REGEX = /COUNTIF|COUNTIFS|CONT\.SE|CONT\.SES/gi;
 
 export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): Promise<ErrorDetail[]> => {
   return new Promise((resolve, reject) => {
@@ -63,8 +71,12 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
           
           let cellsChecked = 0;
           let formulaCells = 0;
+          let errorCells = 0;
           
-          // Análise de fórmulas e erros
+          // Mapear valores para detectar duplicatas
+          const columnValues: Map<number, Map<string, number[]>> = new Map();
+          
+          // Primeira passagem: coletar dados
           for (let R = range.s.r; R <= range.e.r; R++) {
             for (let C = range.s.c; C <= range.e.c; C++) {
               const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
@@ -76,21 +88,37 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
 
               const cellValue = cell.v?.toString() || '';
               const cellFormula = cell.f || '';
-              const cellType = cell.t; // tipo: 'n' (number), 's' (string), 'e' (error), etc.
-              const cellError = cell.w; // valor formatado
+              const cellType = cell.t;
               
               if (cellFormula) formulaCells++;
               
+              // Coletar valores para detecção de duplicatas (apenas valores não vazios)
+              if (cellValue && !cellFormula && cellValue.trim()) {
+                if (!columnValues.has(C)) {
+                  columnValues.set(C, new Map());
+                }
+                const colMap = columnValues.get(C)!;
+                const normalizedValue = cellValue.toLowerCase().trim();
+                if (!colMap.has(normalizedValue)) {
+                  colMap.set(normalizedValue, []);
+                }
+                colMap.get(normalizedValue)!.push(R);
+              }
+              
               // CRÍTICO: Verificar se a célula tem tipo 'e' (error)
               if (cellType === 'e') {
-                console.log(`❌ Erro detectado em ${cellAddress}:`, cellValue, cellFormula);
+                errorCells++;
+                console.log(`❌ Erro tipo 'e' em ${sheetName}!${cellAddress}:`, cellValue);
                 
                 let errorType = 'VALUE';
-                if (cellValue.includes('REF')) errorType = 'REF';
-                else if (cellValue.includes('DIV')) errorType = 'DIV';
-                else if (cellValue.includes('NAME')) errorType = 'NAME';
-                else if (cellValue.includes('NULL')) errorType = 'NULL';
-                else if (cellValue.includes('N/A')) errorType = 'NA';
+                const valueUpper = cellValue.toUpperCase();
+                
+                if (valueUpper.includes('REF')) errorType = 'REF';
+                else if (valueUpper.includes('DIV')) errorType = 'DIV';
+                else if (valueUpper.includes('NAME') || valueUpper.includes('NOME')) errorType = 'NAME';
+                else if (valueUpper.includes('NULL') || valueUpper.includes('NULO')) errorType = 'NULL';
+                else if (valueUpper.includes('N/A') || valueUpper.includes('N/D')) errorType = 'NA';
+                else if (valueUpper.includes('NUM') || valueUpper.includes('NÚM')) errorType = 'NUM';
                 
                 const error: ErrorDetail = {
                   row: R + 1,
@@ -114,7 +142,7 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
               // 1. Detectar erros de fórmula via padrões de texto
               for (const [errorType, pattern] of Object.entries(ERROR_PATTERNS)) {
                 if (pattern.test(cellValue) || pattern.test(cellFormula)) {
-                  console.log(`⚠️ Erro de padrão detectado em ${cellAddress}:`, errorType);
+                  console.log(`⚠️ Erro de padrão "${errorType}" em ${sheetName}!${cellAddress}`);
                   
                   const error: ErrorDetail = {
                     row: R + 1,
@@ -136,25 +164,58 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
                 }
               }
               
-              // 2. Validação de tipos de dados
+              // 2. Detectar fórmulas suspeitas ou problemáticas
+              if (cellFormula) {
+                const formulaIssue = detectFormulaIssues(cellFormula, cellAddress, sheetName, R, C);
+                if (formulaIssue) errors.push(formulaIssue);
+              }
+              
+              // 3. Validação de tipos de dados
               if (cellValue && !cellFormula) {
                 const typeError = validateDataType(cell, R, C, sheetName, worksheet, range);
                 if (typeError) errors.push(typeError);
               }
+              
+              // 4. Detectar células vazias em meio a dados
+              const emptyGapError = detectEmptyGaps(worksheet, R, C, range, sheetName);
+              if (emptyGapError) errors.push(emptyGapError);
             }
           }
           
-          console.log(`✅ "${sheetName}": ${cellsChecked} células verificadas, ${formulaCells} fórmulas`);
+          console.log(`✅ "${sheetName}": ${cellsChecked} células, ${formulaCells} fórmulas, ${errorCells} erros tipo 'e'`);
           
-          // 3. Validar células mescladas problemáticas
+          // 5. Detectar duplicatas em colunas
+          columnValues.forEach((valueMap, colIndex) => {
+            valueMap.forEach((rows, value) => {
+              if (rows.length > 1 && value.length > 2) { // Ignorar valores muito curtos
+                rows.forEach(rowIndex => {
+                  errors.push({
+                    row: rowIndex + 1,
+                    col: XLSX.utils.encode_col(colIndex),
+                    type: 'DUPLICATE',
+                    value: value,
+                    sheet: sheetName,
+                    severity: 'info',
+                    reason: `Valor duplicado encontrado em ${rows.length} células desta coluna.`,
+                  });
+                });
+              }
+            });
+          });
+          
+          // 6. Validar células mescladas problemáticas
           mergedCells.forEach(merge => {
             const mergeError = validateMergedCell(merge, sheetName, worksheet);
             if (mergeError) errors.push(mergeError);
           });
           
-          // 4. Detectar referências cruzadas quebradas entre sheets
+          // 7. Detectar referências cruzadas quebradas entre sheets
           const crossSheetErrors = validateCrossSheetReferences(worksheet, sheetName, workbook, range);
           errors.push(...crossSheetErrors);
+          
+          // 8. Detectar padrões de formatação inconsistentes
+          const formatErrors = detectFormatInconsistencies(worksheet, sheetName, range);
+          errors.push(...formatErrors);
         });
 
         console.log(`🎯 Total de erros detectados: ${errors.length}`);
@@ -168,6 +229,168 @@ export const analyzeExcelFile = async (file: File, selectedSheets?: string[]): P
     reader.onerror = () => reject(new Error('Erro ao ler o arquivo'));
     reader.readAsBinaryString(file);
   });
+};
+
+// Nova função: Detectar problemas em fórmulas
+const detectFormulaIssues = (
+  formula: string,
+  cellAddress: string,
+  sheetName: string,
+  row: number,
+  col: number
+): ErrorDetail | null => {
+  const upperFormula = formula.toUpperCase();
+  
+  // Detectar fórmulas muito longas (podem causar problemas de performance)
+  if (formula.length > 500) {
+    return {
+      row: row + 1,
+      col: XLSX.utils.encode_col(col),
+      type: 'COMPLEX_FORMULA',
+      value: `=${formula.substring(0, 100)}...`,
+      sheet: sheetName,
+      severity: 'info',
+      reason: 'Fórmula muito longa e complexa. Considere dividir em células auxiliares.',
+    };
+  }
+  
+  // Detectar muitos IFs aninhados
+  const ifCount = (upperFormula.match(/\bIF\(/g) || []).length;
+  if (ifCount > 5) {
+    return {
+      row: row + 1,
+      col: XLSX.utils.encode_col(col),
+      type: 'NESTED_IFS',
+      value: `=${formula}`,
+      sheet: sheetName,
+      severity: 'warning',
+      reason: `${ifCount} funções IF aninhadas detectadas. Considere usar SWITCH ou tabelas de referência.`,
+    };
+  }
+  
+  // Detectar VLOOKUP sem bloqueio de referência ($)
+  if (VLOOKUP_REGEX.test(upperFormula) && !formula.includes('$')) {
+    return {
+      row: row + 1,
+      col: XLSX.utils.encode_col(col),
+      type: 'VLOOKUP_NO_LOCK',
+      value: `=${formula}`,
+      sheet: sheetName,
+      severity: 'warning',
+      reason: 'VLOOKUP/PROCV sem referências absolutas ($). Pode causar erros ao copiar.',
+      proposed: `=${formula.replace(/([A-Z]+)(\d+)/g, '$$$1$$$2')}`,
+    };
+  }
+  
+  return null;
+};
+
+// Nova função: Detectar lacunas vazias em meio aos dados
+const detectEmptyGaps = (
+  worksheet: XLSX.WorkSheet,
+  row: number,
+  col: number,
+  range: XLSX.Range,
+  sheetName: string
+): ErrorDetail | null => {
+  const cell = worksheet[XLSX.utils.encode_cell({ r: row, c: col })];
+  
+  // Se a célula não está vazia, não há gap
+  if (cell && cell.v) return null;
+  
+  // Verificar se há dados acima e abaixo (gap vertical)
+  let hasAbove = false;
+  let hasBelow = false;
+  
+  for (let R = range.s.r; R < row; R++) {
+    const aboveCell = worksheet[XLSX.utils.encode_cell({ r: R, c: col })];
+    if (aboveCell && aboveCell.v) {
+      hasAbove = true;
+      break;
+    }
+  }
+  
+  for (let R = row + 1; R <= range.e.r; R++) {
+    const belowCell = worksheet[XLSX.utils.encode_cell({ r: R, c: col })];
+    if (belowCell && belowCell.v) {
+      hasBelow = true;
+      break;
+    }
+  }
+  
+  if (hasAbove && hasBelow) {
+    return {
+      row: row + 1,
+      col: XLSX.utils.encode_col(col),
+      type: 'EMPTY_GAP',
+      value: '(vazio)',
+      sheet: sheetName,
+      severity: 'info',
+      reason: 'Célula vazia detectada em meio aos dados. Pode indicar informação faltante.',
+    };
+  }
+  
+  return null;
+};
+
+// Nova função: Detectar inconsistências de formatação
+const detectFormatInconsistencies = (
+  worksheet: XLSX.WorkSheet,
+  sheetName: string,
+  range: XLSX.Range
+): ErrorDetail[] => {
+  const errors: ErrorDetail[] = [];
+  
+  // Analisar cada coluna em busca de formatos inconsistentes
+  for (let C = range.s.c; C <= range.e.c; C++) {
+    const columnFormats: Map<string, number[]> = new Map();
+    
+    for (let R = range.s.r; R <= range.e.r; R++) {
+      const cell = worksheet[XLSX.utils.encode_cell({ r: R, c: C })];
+      if (!cell || !cell.v) continue;
+      
+      const value = cell.v.toString();
+      
+      // Detectar formato (número, data, email, telefone, etc)
+      let format = 'text';
+      if (NUMBER_PATTERN.test(value)) format = 'number';
+      else if (DATE_PATTERN.test(value)) format = 'date';
+      else if (EMAIL_PATTERN.test(value)) format = 'email';
+      else if (PHONE_PATTERN.test(value) && value.length > 8) format = 'phone';
+      else if (CURRENCY_PATTERN.test(value)) format = 'currency';
+      
+      if (!columnFormats.has(format)) {
+        columnFormats.set(format, []);
+      }
+      columnFormats.get(format)!.push(R);
+    }
+    
+    // Se há múltiplos formatos na mesma coluna (e não é só texto)
+    if (columnFormats.size > 1) {
+      const formats = Array.from(columnFormats.keys());
+      const mainFormat = formats.find(f => f !== 'text') || 'text';
+      
+      // Reportar células com formato diferente do predominante
+      columnFormats.forEach((rows, format) => {
+        if (format !== mainFormat && rows.length < 5) { // Apenas se for minoria
+          rows.forEach(R => {
+            const cell = worksheet[XLSX.utils.encode_cell({ r: R, c: C })];
+            errors.push({
+              row: R + 1,
+              col: XLSX.utils.encode_col(C),
+              type: 'FORMAT_MISMATCH',
+              value: cell.v?.toString() || '',
+              sheet: sheetName,
+              severity: 'info',
+              reason: `Formato "${format}" detectado em coluna com formato predominante "${mainFormat}".`,
+            });
+          });
+        }
+      });
+    }
+  }
+  
+  return errors;
 };
 
 // Nova função: Validar tipo de dados
@@ -293,8 +516,8 @@ const proposeFixForError = (
 
   const upperFormula = formula.toUpperCase();
 
-  // Correção para #REF! em VLOOKUP/PROCV
-  if (error.type === 'REF' && (VLOOKUP_REGEX.test(upperFormula) || PROCV_REGEX.test(upperFormula))) {
+  // Correção para #REF! em VLOOKUP/PROCV/HLOOKUP/PROCH
+  if (error.type === 'REF' && (VLOOKUP_REGEX.test(upperFormula) || HLOOKUP_REGEX.test(upperFormula))) {
     const lastCol = XLSX.utils.encode_col(range.e.c);
     const lastRow = range.e.r + 1;
     const suggestedRange = `A1:${lastCol}${lastRow}`;
